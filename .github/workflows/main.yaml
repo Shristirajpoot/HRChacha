@@ -1,0 +1,92 @@
+name: CI/CD to AWS ECR, EC2
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'README.md'
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  IMAGE_TAG: latest
+
+jobs:
+  build-and-push-ecr:
+    name: Build and Push Docker Image to AWS ECR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Create ECR Repository (if not exists)
+        run: |
+          aws ecr describe-repositories --repository-names ${{ secrets.ECR_REPOSITORY_NAME }} || \
+          aws ecr create-repository --repository-name ${{ secrets.ECR_REPOSITORY_NAME }}
+
+      - name: Build, Tag and Push Docker Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.IMAGE_TAG }} .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.IMAGE_TAG }}
+        
+
+  deploy-on-ec2:
+    name: Deploy to EC2
+    needs: build-and-push-ecr
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Clean old containers and images
+        run: |
+          docker stop $(docker ps -aq) || true
+          docker rm -f $(docker ps -aq) || true
+          docker rmi -f $(docker images -aq) || true
+          docker volume rm $(docker volume ls -q) || true
+          docker network prune -f || true
+
+      - name: Pull and Run Docker Image on EC2
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
+        run: |
+          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.IMAGE_TAG }}
+
+          docker stop hrchacha || true
+          docker rm hrchacha || true
+
+          docker run -d -p 8501:8501 --name hrchacha \
+            -e MONGO_URI="${{ secrets.MONGO_URI }}" \
+            -e TOGETHER_API_KEY="${{ secrets.TOGETHER_API_KEY }}" \
+            $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.IMAGE_TAG }}
